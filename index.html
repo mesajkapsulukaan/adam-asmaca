@@ -546,7 +546,13 @@ const ALPHABET = [...'ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ'];
 const PALETTE = ['#e2572b','#2f8f9d','#7a5cc7','#d4a017','#3b8a4a','#c2417a','#3d6bd1','#e0803a',
                  '#6b8e23','#a0522d','#c0392b','#16a085','#8e44ad','#2c82c9','#d35400'];
 const CODE_CHARS = 'ABCDEFGHJKLMNPRSTUVYZ23456789';
-const ICE = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:global.stun.twilio.com:3478' }];
+// PeerJS'in varsayılan sunucuları (STUN + ücretsiz TURN). TURN, farklı ağlardaki
+// (mobil veri, okul/ev Wi-Fi'si) oyuncuların birbirine bağlanması için gerekli.
+const ICE = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:global.stun.twilio.com:3478' },
+  { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' }
+];
 
 const trUp = s => String(s).toLocaleUpperCase('tr');
 const trLow = s => String(s).toLocaleLowerCase('tr');
@@ -752,8 +758,11 @@ function randomCode() { let s = ''; for (let i = 0; i < 5; i++) s += CODE_CHARS[
 function openPeer(id) {
   return new Promise((res, rej) => {
     const p = id ? new Peer(id, peerOpts()) : new Peer(peerOpts());
-    p.on('open', () => res(p));
-    p.on('error', e => { try { p.destroy(); } catch (x) {} rej(e); });
+    // Bu hata dinleyicisi sadece bağlanma sırasında geçerli; sonradan küçük bir
+    // hata (ör. biri bağlanamadı) lobiyi öldürmesin diye 'open' olunca kaldırılır.
+    const onErr = e => { try { p.destroy(); } catch (x) {} rej(e); };
+    p.on('error', onErr);
+    p.on('open', () => { p.off('error', onErr); res(p); });
   });
 }
 function teardown() {
@@ -1053,9 +1062,9 @@ async function joinLobby(raw) {
   const fail = m => goMenu(m);
   peer.on('error', e => {
     if (e && e.type === 'peer-unavailable') fail('Bu kodla bir lobi bulunamadı 😕');
-    else if (!gone) fail('Bağlantı hatası: ' + ((e && e.type) || 'bilinmiyor'));
+    else if (!gone && !S) fail('Bağlantı hatası: ' + ((e && e.type) || 'bilinmiyor'));
   });
-  joinTimer = setTimeout(() => fail('Lobiye ulaşılamadı. Kod doğru mu? Ev sahibi hâlâ sayfada mı?'), 15000);
+  joinTimer = setTimeout(() => fail('Lobiye bağlanılamadı (zaman aşımı). Kod doğru mu, lobi sahibi sayfayı açık tutuyor mu? Hâlâ olmuyorsa ikiniz de aynı Wi-Fi\'ye ya da mobil veriye geçip dene.'), 25000);
   conn = peer.connect(PREFIX + c, { reliable: true });
   conn.on('open', () => send(conn, { t: 'join', name: me.name }));
   conn.on('data', onClientMsg);
