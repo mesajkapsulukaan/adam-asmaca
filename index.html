@@ -527,11 +527,11 @@ input[type=text]:focus{border-color:var(--amber);box-shadow:0 0 0 5px rgba(242,1
 <div id="busy" class="busy hidden"><div class="spinner"></div><p id="busyMsg">Bağlanıyor…</p></div>
 <div id="toast" class="toast" role="status"></div>
 
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/mqtt@5/dist/mqtt.min.js';document.head.appendChild(s)"></script>
 <script>
 /* ===========================================================
    Adam Asmaca – çok oyunculu (en fazla 15 kişi)
-   - Sunucu yok: PeerJS (WebRTC) ile lobi sahibi "sunucu" gibi çalışır.
+   - Kendi sunucun yok: mesajlar herkese açık ücretsiz MQTT sunucuları üzerinden aktarılır.
    - Kelimeler: hazır liste + TDK (sozluk.gov.tr) anlam/ipucu ve rastgele TDK modu.
    =========================================================== */
 'use strict';
@@ -539,19 +539,19 @@ input[type=text]:focus{border-color:var(--amber);box-shadow:0 0 0 5px rgba(242,1
 
 /* ---------------- Sabitler ---------------- */
 const MAX_PLAYERS = 15;
-const PREFIX = 'adamasmaca-v1-';
+const PREFIX = 'adamasmaca-x9k2/';
 const TURN_MS = 25000;
 const END_WAIT = 6500;
 const ALPHABET = [...'ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ'];
 const PALETTE = ['#e2572b','#2f8f9d','#7a5cc7','#d4a017','#3b8a4a','#c2417a','#3d6bd1','#e0803a',
                  '#6b8e23','#a0522d','#c0392b','#16a085','#8e44ad','#2c82c9','#d35400'];
 const CODE_CHARS = 'ABCDEFGHJKLMNPRSTUVYZ23456789';
-// PeerJS'in varsayılan sunucuları (STUN + ücretsiz TURN). TURN, farklı ağlardaki
-// (mobil veri, okul/ev Wi-Fi'si) oyuncuların birbirine bağlanması için gerekli.
-const ICE = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:global.stun.twilio.com:3478' },
-  { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' }
+// Herkese açık ücretsiz MQTT sunucuları mesaj aktarır (WebRTC gibi ağa bağlı sorun çıkarmaz).
+// Lobi kodunun ilk harfi hangi sunucunun kullanıldığını belirler.
+const BROKERS = [
+  { ch: 'E', url: 'wss://broker.emqx.io:8084/mqtt' },
+  { ch: 'H', url: 'wss://broker.hivemq.com:8884/mqtt' },
+  { ch: 'M', url: 'wss://test.mosquitto.org:8081' }
 ];
 
 const trUp = s => String(s).toLocaleUpperCase('tr');
@@ -679,8 +679,9 @@ function infoDialog(title, text, cb) {
 }
 
 /* ---------------- Durum değişkenleri ---------------- */
-let peer = null, conn = null, isHost = false, code = '', me = { id: '', name: '' };
-const conns = new Map();
+let mq = null, isHost = false, code = '', me = { id: '', name: '' };
+let upT = '', downT = '', infoT = '', myId = '', joined = false, lastHost = 0, hbTimer = null, wdTimer = null;
+const lastSeen = new Map();
 let S = null;            // herkesin gördüğü ortak durum
 let H = null;            // sadece lobi sahibinde: gerçek oyun durumu
 let off = 0;             // lobi sahibi ile saat farkı
@@ -750,34 +751,54 @@ function loadTdkPool() {
   return tdkPoolP;
 }
 
-/* ---------------- Ağ yardımcıları ---------------- */
-function send(c, o) { try { c.send(o); } catch (e) {} }
-function broadcast(o) { conns.forEach(c => send(c, o)); }
-function peerOpts() { return { debug: 0, config: { iceServers: ICE } }; }
+/* ---------------- Ağ yardımcıları (MQTT röle) ---------------- */
+function pubMsg(topic, obj, retain) {
+  try { if (mq) mq.publish(topic, typeof obj === 'string' ? obj : JSON.stringify(obj), { qos: 0, retain: !!retain }); } catch (e) {}
+}
+function toAll(o) { pubMsg(downT, Object.assign({ to: '*' }, o)); }
+function toOne(id, o) { pubMsg(downT, Object.assign({ to: id }, o)); }
 function randomCode() { let s = ''; for (let i = 0; i < 5; i++) s += CODE_CHARS[rnd(CODE_CHARS.length)]; return s; }
-function openPeer(id) {
-  return new Promise((res, rej) => {
-    const p = id ? new Peer(id, peerOpts()) : new Peer(peerOpts());
-    // Bu hata dinleyicisi sadece bağlanma sırasında geçerli; sonradan küçük bir
-    // hata (ör. biri bağlanamadı) lobiyi öldürmesin diye 'open' olunca kaldırılır.
-    const onErr = e => { try { p.destroy(); } catch (x) {} rej(e); };
-    p.on('error', onErr);
-    p.on('open', () => { p.off('error', onErr); res(p); });
+function randomId() { const a = 'abcdefghijklmnopqrstuvwxyz0123456789'; let s = 'p'; for (let i = 0; i < 9; i++) s += a[rnd(a.length)]; return s; }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function waitMqtt() {
+  return new Promise(res => { let n = 0; (function chk() { if (window.mqtt) return res(true); if (++n > 80) return res(false); setTimeout(chk, 100); })(); });
+}
+function connectOne(url, will) {
+  return new Promise(async res => {
+    if (!(await waitMqtt())) return res(null);
+    let c = null, done = false, tm = null;
+    const onErr = () => fin(null), onClose = () => fin(null);
+    function fin(v) {
+      if (done) return; done = true; clearTimeout(tm);
+      if (v) { v.removeListener('error', onErr); v.removeListener('close', onClose); v.on('error', () => {}); v.options.reconnectPeriod = 3000; }
+      else { try { c && c.end(true); } catch (e) {} }
+      res(v);
+    }
+    tm = setTimeout(() => fin(null), 9000);
+    try {
+      c = window.mqtt.connect(url, { clientId: 'as-' + randomId() + rnd(1e6), clean: true, connectTimeout: 8000, reconnectPeriod: 0, keepalive: 25, will });
+    } catch (e) { return fin(null); }
+    c.on('connect', () => fin(c));
+    c.on('error', onErr);
+    c.on('close', onClose);
   });
+}
+function sub(c, topics) {
+  return new Promise(res => { try { c.subscribe(topics, { qos: 0 }, err => res(!err)); } catch (e) { res(false); } });
 }
 function teardown() {
   if (H) { clearTimeout(H.tt); clearTimeout(H.nt); H.alive = false; }
-  const p = peer, cs = [...conns.values()], c = conn, wasHost = isHost;
-  if (wasHost) broadcast({ t: 'closed' });
-  peer = null; conn = null; H = null; S = null; isHost = false; code = ''; gone = false;
-  conns.clear(); clearTimeout(joinTimer);
+  const c = mq;
+  if (c) {
+    if (isHost) { pubMsg(downT, { to: '*', t: 'closed' }); pubMsg(infoT, '', true); }
+    else if (joined) pubMsg(upT, { f: myId, t: 'leave' });
+  }
+  mq = null; H = null; S = null; isHost = false; code = ''; gone = false; joined = false;
+  upT = ''; downT = ''; infoT = ''; lastSeen.clear();
+  clearTimeout(joinTimer); clearInterval(joinTimer); clearInterval(hbTimer); clearInterval(wdTimer);
   logs = []; floats = {}; lastTurn = null; prevMask = []; prevRound = 0; prevWrong = 0; shownEnd = 0;
   closeModal(); hideBusy();
-  setTimeout(() => {
-    try { cs.forEach(x => x.close()); } catch (e) {}
-    try { c && c.close(); } catch (e) {}
-    try { p && p.destroy(); } catch (e) {}
-  }, 250);
+  setTimeout(() => { try { c && c.end(false); } catch (e) {} }, 400);
 }
 function goMenu(msg) {
   teardown();
@@ -831,12 +852,12 @@ function pub() {
 function pushState() {
   if (!H || !H.alive) return;
   S = pub(); off = 0;
-  broadcast({ t: 'state', s: S });
+  toAll({ t: 'state', s: S });
   render();
 }
 function emit(ev) {
   handleEv(ev);
-  broadcast({ t: 'ev', ev });
+  toAll({ t: 'ev', ev });
 }
 function clearTimers() { clearTimeout(H.tt); clearTimeout(H.nt); }
 const onlineIds = () => H.players.filter(p => p.on).map(p => p.id);
@@ -986,7 +1007,7 @@ function guessWord(pid, w) {
 }
 function onLeave(pid) {
   if (!H || !H.alive) return;
-  conns.delete(pid);
+  lastSeen.delete(pid);
   const p = getP(pid); if (!p) return;
   if (H.phase === 'lobby') H.players = H.players.filter(x => x.id !== pid);
   else p.on = false;
@@ -994,51 +1015,67 @@ function onLeave(pid) {
   if (H.phase === 'playing' && H.set.mode === 'turn' && H.turn === pid) advanceTurn();
   pushState();
 }
-function kick(pid) {
-  const c = conns.get(pid);
-  if (c) { send(c, { t: 'kicked' }); setTimeout(() => { try { c.close(); } catch (e) {} }, 200); }
-  onLeave(pid);
-}
-function hostConnection(c) {
-  c.on('data', m => {
-    if (!H || !H.alive || !m || typeof m.t !== 'string') return;
-    if (m.t === 'join') {
-      if (getP(c.peer)) return;
-      if (H.phase !== 'lobby') { send(c, { t: 'deny', why: 'Oyun çoktan başlamış, sonraki oyunu bekle 🙂' }); setTimeout(() => c.close(), 300); return; }
-      if (H.players.length >= MAX_PLAYERS) { send(c, { t: 'deny', why: `Lobi dolu (${MAX_PLAYERS}/${MAX_PLAYERS}).` }); setTimeout(() => c.close(), 300); return; }
-      const name = uniqueName(sanitizeName(m.name));
-      H.players.push({ id: c.peer, name, score: 0, on: true, ci: freeColor() });
-      conns.set(c.peer, c);
-      send(c, { t: 'welcome', you: c.peer, name });
-      emit({ k: 'sys', m: `${name} katıldı 👋`, fx: 'join' });
-      pushState();
-    } else if (m.t === 'guess') guessLetter(c.peer, String(m.l || ''));
-    else if (m.t === 'word') guessWord(c.peer, m.w);
-  });
-  c.on('close', () => onLeave(c.peer));
-  c.on('error', () => {});
+function kick(pid) { toOne(pid, { t: 'kicked' }); onLeave(pid); }
+function hostMsg(m) {
+  const id = String(m.f || '').slice(0, 24);
+  if (!id || id === 'host') return;
+  lastSeen.set(id, Date.now());
+  if (m.t === 'join') {
+    if (getP(id)) { toOne(id, { t: 'welcome', you: id }); toOne(id, { t: 'state', s: S }); return; }
+    if (H.phase !== 'lobby') { toOne(id, { t: 'deny', why: 'Oyun çoktan başlamış, sonraki oyunu bekle 🙂' }); return; }
+    if (H.players.length >= MAX_PLAYERS) { toOne(id, { t: 'deny', why: `Lobi dolu (${MAX_PLAYERS}/${MAX_PLAYERS}).` }); return; }
+    const name = uniqueName(sanitizeName(m.name));
+    H.players.push({ id, name, score: 0, on: true, ci: freeColor() });
+    toOne(id, { t: 'welcome', you: id });
+    emit({ k: 'sys', m: `${name} katıldı 👋`, fx: 'join' });
+    pushState();
+  } else if (!getP(id)) return;
+  else if (m.t === 'guess') guessLetter(id, String(m.l || ''));
+  else if (m.t === 'word') guessWord(id, m.w);
+  else if (m.t === 'leave') onLeave(id);
 }
 
 async function createLobby() {
   showBusy('Lobi kuruluyor…');
   teardown();
-  let p = null;
-  for (let i = 0; i < 6 && !p; i++) {
-    const c = randomCode();
-    try { p = await openPeer(PREFIX + c); code = c; }
-    catch (e) {
-      if (e && e.type === 'unavailable-id') continue;
-      hideBusy(); goMenu('Lobi kurulamadı (' + ((e && e.type) || 'bağlantı') + '). İnternetini kontrol edip tekrar dene.'); return;
+  showBusy('Lobi kuruluyor…');
+  let got = null;
+  for (let bi = 0; bi < BROKERS.length && !got; bi++) {
+    for (let k = 0; k < 2 && !got; k++) {
+      const cd = BROKERS[bi].ch + randomCode().slice(1), base = PREFIX + cd;
+      const cl = await connectOne(BROKERS[bi].url, { topic: base + '/down', payload: JSON.stringify({ to: '*', t: 'closed' }), qos: 0, retain: false });
+      if (!cl) break;                                   // bu sunucuya ulaşılamadı → sıradaki
+      let taken = false;
+      cl.on('message', t => { if (t === base + '/info') taken = true; });
+      await sub(cl, [base + '/info']);
+      await sleep(1200);                                // aynı kodlu başka lobi var mı?
+      if (taken) { try { cl.end(true); } catch (e) {} continue; }
+      got = { cl, cd, base };
     }
   }
-  if (!p) { hideBusy(); goMenu('Lobi kurulamadı, tekrar dene.'); return; }
-  peer = p; isHost = true; gone = false;
-  me.id = 'host';
+  if (!got) { goMenu('Lobi kurulamadı: oyun sunucularına ulaşılamadı. İnternetini kontrol edip tekrar dene.'); return; }
+  const cl = got.cl;
+  mq = cl; code = got.cd; isHost = true; gone = false; joined = false;
+  upT = got.base + '/up'; downT = got.base + '/down'; infoT = got.base + '/info';
+  myId = 'host'; me.id = 'host';
   H = newGame();
   H.players.push({ id: 'host', name: me.name, score: 0, on: true, ci: 0 });
-  peer.on('connection', hostConnection);
-  peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} });
-  peer.on('error', e => { if (e && ['network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) toast('Sinyal sunucusuyla bağlantı koptu, yeniden deneniyor…'); });
+  cl.removeAllListeners('message');
+  cl.on('message', (topic, payload) => {
+    if (cl !== mq || topic !== upT || !H || !H.alive) return;
+    let m; try { m = JSON.parse(payload.toString()); } catch (e) { return; }
+    if (m && typeof m.t === 'string') hostMsg(m);
+  });
+  const announce = () => pubMsg(infoT, { n: me.name, ts: Date.now() }, true);
+  cl.on('connect', announce);                           // bağlantı kopup gelirse lobiyi yeniden duyur
+  announce();
+  await sub(cl, [upT]);
+  hbTimer = setInterval(() => toAll({ t: 'ping' }), 5000);
+  wdTimer = setInterval(() => {
+    if (!H || !H.alive) return;
+    const now = Date.now();
+    H.players.filter(p => p.id !== 'host' && p.on).forEach(p => { if (now - (lastSeen.get(p.id) || 0) > 16000) onLeave(p.id); });
+  }, 3000);
   hideBusy();
   logs = [];
   pushState();
@@ -1051,32 +1088,60 @@ async function joinLobby(raw) {
   const c = String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   const err = $('menuErr');
   if (c.length !== 5) { err.textContent = 'Lobi kodu 5 haneli olmalı.'; err.classList.remove('hidden'); return; }
+  const br = BROKERS.find(b => b.ch === c[0]);
+  if (!br) { err.textContent = 'Bu kod geçersiz görünüyor, tekrar kontrol et.'; err.classList.remove('hidden'); return; }
   err.classList.add('hidden');
   showBusy('Lobiye bağlanılıyor…');
   teardown();
   showBusy('Lobiye bağlanılıyor…');
-  let p;
-  try { p = await openPeer(); }
-  catch (e) { goMenu('Bağlantı kurulamadı (' + ((e && e.type) || 'ağ') + ').'); return; }
-  peer = p; isHost = false; gone = false; code = c;
-  const fail = m => goMenu(m);
-  peer.on('error', e => {
-    if (e && e.type === 'peer-unavailable') fail('Bu kodla bir lobi bulunamadı 😕');
-    else if (!gone && !S) fail('Bağlantı hatası: ' + ((e && e.type) || 'bilinmiyor'));
+  const id = randomId(), base = PREFIX + c;
+  const cl = await connectOne(br.url, { topic: base + '/up', payload: JSON.stringify({ f: id, t: 'leave' }), qos: 0, retain: false });
+  if (!cl) { goMenu('Oyun sunucusuna bağlanılamadı. İnternetini kontrol edip tekrar dene.'); return; }
+  mq = cl; isHost = false; gone = false; joined = false; code = c; myId = id; me.id = id;
+  upT = base + '/up'; downT = base + '/down'; infoT = base + '/info';
+  let found = false;
+  cl.on('message', (topic, payload) => {
+    if (cl !== mq) return;
+    const s = payload.toString();
+    if (topic === infoT) { if (s) found = true; return; }
+    let m; try { m = JSON.parse(s); } catch (e) { return; }
+    if (!m || (m.to !== '*' && m.to !== myId)) return;
+    lastHost = Date.now();
+    onClientMsg(m);
   });
-  joinTimer = setTimeout(() => fail('Lobiye bağlanılamadı (zaman aşımı). Kod doğru mu, lobi sahibi sayfayı açık tutuyor mu? Hâlâ olmuyorsa ikiniz de aynı Wi-Fi\'ye ya da mobil veriye geçip dene.'), 25000);
-  conn = peer.connect(PREFIX + c, { reliable: true });
-  conn.on('open', () => send(conn, { t: 'join', name: me.name }));
-  conn.on('data', onClientMsg);
-  conn.on('close', () => { if (!gone && peer) { gone = true; infoDialog('Bağlantı koptu', 'Lobi ile bağlantı kesildi.', () => goMenu()); } });
+  await sub(cl, [infoT, downT]);
+  for (let i = 0; i < 60 && !found && cl === mq; i++) await sleep(100);
+  if (cl !== mq) return;
+  if (!found) { goMenu('Bu kodla açık bir lobi bulunamadı 😕 Kodu kontrol et; lobi sahibi sayfayı açık tutuyor mu?'); return; }
+  lastHost = Date.now();
+  let tries = 0;
+  const sendJoin = () => pubMsg(upT, { f: myId, t: 'join', name: me.name });
+  sendJoin();
+  joinTimer = setInterval(() => {
+    if (joined || cl !== mq) { clearInterval(joinTimer); return; }
+    if (++tries >= 4) { clearInterval(joinTimer); goMenu('Lobi cevap vermedi. Lobi sahibi sayfayı açık tutuyor mu?'); return; }
+    sendJoin();
+  }, 2000);
 }
 function onClientMsg(m) {
   if (!m || typeof m.t !== 'string') return;
   switch (m.t) {
-    case 'welcome': clearTimeout(joinTimer); me.id = m.you; hideBusy(); logs = []; break;
+    case 'welcome':
+      if (joined) break;
+      joined = true; clearInterval(joinTimer); hideBusy(); logs = [];
+      hbTimer = setInterval(() => pubMsg(upT, { f: myId, t: 'hb' }), 4000);
+      wdTimer = setInterval(() => {
+        if (!gone && Date.now() - lastHost > 22000) { gone = true; infoDialog('Bağlantı koptu', 'Lobi ile bağlantı kesildi.', () => goMenu()); }
+      }, 3000);
+      break;
+    case 'ping': break;
     case 'deny': gone = true; goMenu(String(m.why || 'Katılamadın.')); break;
-    case 'state': S = m.s; off = (S.now || Date.now()) - Date.now(); render(); break;
-    case 'ev': handleEv(m.ev || {}); break;
+    case 'state':
+      if (!joined) break;
+      S = m.s; off = (S.now || Date.now()) - Date.now();
+      if (!S.players.some(p => p.id === myId)) { gone = true; goMenu('Lobiden düştün (bağlantı zaman aşımı).'); break; }
+      render(); break;
+    case 'ev': if (joined) handleEv(m.ev || {}); break;
     case 'kicked': gone = true; goMenu('Lobi sahibi seni lobiden çıkardı.'); break;
     case 'closed': if (!gone) { gone = true; infoDialog('Lobi kapandı', 'Lobi sahibi oyundan ayrıldı.', () => goMenu()); } break;
   }
@@ -1086,7 +1151,7 @@ function act(msg) {
   if (isHost) {
     if (msg.t === 'guess') guessLetter('host', msg.l);
     else if (msg.t === 'word') guessWord('host', msg.w);
-  } else if (conn) send(conn, msg);
+  } else pubMsg(upT, Object.assign({ f: myId }, msg));
 }
 
 /* =====================================================================
@@ -1374,7 +1439,10 @@ muteBtn.onclick = () => {
   if (!muted) { actx(); SFX.click(); }
 };
 
-window.addEventListener('beforeunload', () => { if (isHost) broadcast({ t: 'closed' }); });
+window.addEventListener('beforeunload', () => {
+  if (isHost) { toAll({ t: 'closed' }); pubMsg(infoT, '', true); }
+  else if (joined) pubMsg(upT, { f: myId, t: 'leave' });
+});
 
 /* ---------------- Başlangıç: davet linki ---------------- */
 (function init() {
