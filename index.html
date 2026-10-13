@@ -250,6 +250,7 @@ input[type=text]:focus{border-color:var(--amber);box-shadow:0 0 0 5px rgba(242,1
 
 .hint{min-height:1.5rem;font-weight:700;color:var(--ink2);margin:.2rem 0 .6rem;font-size:.98rem}
 .hint b{color:var(--ink)}
+.secret{display:inline-block;margin-top:.3rem;background:#fff;border:2px dashed var(--amber);border-radius:12px;padding:.15rem .8rem;font-family:var(--ff-head);font-weight:600;letter-spacing:.12em;color:var(--ember)}
 .turn-banner{
   display:inline-block;font-family:var(--ff-head);font-weight:600;font-size:1.05rem;
   background:#fff;border:2px solid #e1bd84;border-radius:99px;padding:.25rem 1rem;margin-bottom:.6rem;
@@ -542,6 +543,7 @@ const MAX_PLAYERS = 15;
 const PREFIX = 'adamasmaca-x9k2/';
 const TURN_MS = 25000;
 const END_WAIT = 6500;
+const SET_MS = 90000;   // 'Kelime Seç' modunda kelime yazma süresi
 const ALPHABET = [...'ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ'];
 const PALETTE = ['#e2572b','#2f8f9d','#7a5cc7','#d4a017','#3b8a4a','#c2417a','#3d6bd1','#e0803a',
                  '#6b8e23','#a0522d','#c0392b','#16a085','#8e44ad','#2c82c9','#d35400'];
@@ -686,7 +688,7 @@ let S = null;            // herkesin gördüğü ortak durum
 let H = null;            // sadece lobi sahibinde: gerçek oyun durumu
 let off = 0;             // lobi sahibi ile saat farkı
 let pendingCode = '', gone = false, joinTimer = null;
-let logs = [], floats = {}, lastTurn = null, lastTick = -1, prevMask = [], prevRound = 0, prevWrong = 0, shownEnd = 0;
+let logs = [], floats = {}, lastTurn = null, lastTick = -1, prevMask = [], prevRound = 0, prevWrong = 0, shownEnd = 0, shownSet = 0, mySecret = '', secretRound = 0;
 
 /* ---------------- TDK ---------------- */
 const TDK_GTS = 'https://sozluk.gov.tr/gts?ara=';
@@ -796,7 +798,7 @@ function teardown() {
   mq = null; H = null; S = null; isHost = false; code = ''; gone = false; joined = false;
   upT = ''; downT = ''; infoT = ''; lastSeen.clear();
   clearTimeout(joinTimer); clearInterval(joinTimer); clearInterval(hbTimer); clearInterval(wdTimer);
-  logs = []; floats = {}; lastTurn = null; prevMask = []; prevRound = 0; prevWrong = 0; shownEnd = 0;
+  logs = []; floats = {}; lastTurn = null; prevMask = []; prevRound = 0; prevWrong = 0; shownEnd = 0; shownSet = 0; mySecret = ''; secretRound = 0;
   closeModal(); hideBusy();
   setTimeout(() => { try { c && c.end(false); } catch (e) {} }, 400);
 }
@@ -812,9 +814,10 @@ function goMenu(msg) {
    ===================================================================== */
 function newGame() {
   return {
-    alive: true, phase: 'lobby', set: { rounds: 5, lives: 8, mode: 'free', source: 'list' },
+    alive: true, phase: 'lobby', set: { rounds: 5, lives: 8, mode: 'free', source: 'list', guess: 'next' },
     players: [], round: 0, word: '', cat: '', src: 'list', meaning: '', meaningFull: '',
-    guessed: [], wrong: [], strikes: 0, res: null, turn: null, turnEnds: 0, tt: null, nt: null, used: []
+    guessed: [], wrong: [], strikes: 0, res: null, turn: null, turnEnds: 0, tt: null, nt: null, used: [],
+    order: [], total: 5, setter: null, guesser: null
   };
 }
 const getP = id => H.players.find(p => p.id === id);
@@ -838,14 +841,17 @@ function pub() {
   const w = [...H.word];
   const wrongN = H.wrong.length + H.strikes;
   const hintAt = Math.ceil(H.set.lives / 2);
-  const showHint = H.meaning && (wrongN >= hintAt || end);
+  const duel = H.set.mode === 'duel';
+  const showHint = H.meaning && (duel || wrongN >= hintAt || end);
   return {
     now: Date.now(), phase: H.phase, set: H.set, round: H.round, code,
     players: H.players.map(p => ({ id: p.id, name: p.name, score: p.score, on: p.on, ci: p.ci })),
     len: w.length, mask: w.map(c => H.guessed.includes(c) ? c : ''),
     wrong: H.wrong, wrongN, cat: H.cat, src: H.src,
     hasHint: !!H.meaning, hint: showHint ? (end ? H.meaningFull : H.meaning) : '', hintAt,
-    turnId: H.set.mode === 'turn' && H.phase === 'playing' ? H.turn : null, turnEnds: H.turnEnds, turnMs: TURN_MS,
+    turnId: (H.set.mode === 'turn' && H.phase === 'playing') || (duel && (H.phase === 'playing' || H.phase === 'setting')) ? H.turn : null,
+    turnEnds: H.turnEnds, turnMs: H.phase === 'setting' ? SET_MS : TURN_MS,
+    total: H.total, setterId: duel ? H.setter : null, guesserId: duel ? H.guesser : null, hintSrc: duel ? 'setter' : 'tdk',
     res: H.res, word: end ? H.word : ''
   };
 }
@@ -883,7 +889,7 @@ function advanceTurn() {
 
 function setSetting(k, v) {
   if (H.phase !== 'lobby') return;
-  const ok = { rounds: [3, 5, 8], lives: [6, 8, 10], mode: ['free', 'turn'], source: ['list', 'tdk'] };
+  const ok = { rounds: [3, 5, 8], lives: [6, 8, 10], mode: ['free', 'turn', 'duel'], source: ['list', 'tdk'], guess: ['next', 'all'] };
   if (!ok[k] || !ok[k].includes(v)) return;
   H.set = Object.assign({}, H.set, { [k]: v });
   pushState();
@@ -891,8 +897,11 @@ function setSetting(k, v) {
 function startGame() {
   if (!H || H.phase !== 'lobby') return;
   H.players = H.players.filter(p => p.on);
+  if (H.set.mode === 'duel' && H.players.length < 2) { toast('Bu mod için en az 2 oyuncu gerekli 🙂'); return; }
   H.players.forEach(p => p.score = 0);
   H.round = 0; H.used = [];
+  H.order = H.players.map(p => p.id);
+  H.total = H.set.mode === 'duel' ? H.order.length : H.set.rounds;
   emit({ k: 'sys', m: '🎮 Oyun başladı! Bol şans.', reset: true, fx: 'start' });
   nextRound();
 }
@@ -922,6 +931,7 @@ async function nextRound() {
   const r = H.round;
   H.phase = 'picking'; H.res = null; H.word = ''; H.cat = ''; H.meaning = ''; H.meaningFull = '';
   H.guessed = []; H.wrong = []; H.strikes = 0; H.turn = null; H.turnEnds = 0;
+  if (H.set.mode === 'duel') return startDuelRound(r);
   pushState();
   const pick = await pickWord();
   if (!H || !H.alive || H.round !== r || H.phase !== 'picking') return;
@@ -939,18 +949,65 @@ async function nextRound() {
     }
   });
 }
+/* ----- "Kelime Seç" modu: sırayla biri kelime yazar, sıradaki (ya da herkes) süresiz tahmin eder ----- */
+function skipRound() { clearTimers(); H.phase = 'roundEnd'; H.res = null; afterRound(); }
+function startDuelRound(r) {
+  const n = H.order.length, all = H.set.guess === 'all';
+  const sp = getP(H.order[(r - 1) % n]);
+  if (!sp || !sp.on) { emit({ k: 'sys', m: `${sp ? sp.name : 'Bir oyuncu'} ayrıldığı için bu tur atlandı.` }); return skipRound(); }
+  let g = null;
+  for (let k = 1; k < n && !g; k++) { const q = getP(H.order[(r - 1 + k) % n]); if (q && q.on) g = q; }
+  if (!g) { emit({ k: 'sys', m: 'Tahmin edecek oyuncu kalmadı.' }); H.round = H.total; return skipRound(); }
+  H.setter = sp.id; H.guesser = all ? null : g.id; H.src = 'duel';
+  H.phase = 'setting'; H.turn = sp.id;
+  emit({ k: 'sys', m: `✍️ ${sp.name} bir kelime seçiyor… (${all ? 'herkes tahmin edecek' : 'tahmin edecek: ' + g.name})` });
+  startSetTimer();
+  pushState();
+}
+function startSetTimer() {
+  clearTimeout(H.tt);
+  H.turnEnds = Date.now() + SET_MS;
+  H.tt = setTimeout(() => {
+    if (!H || !H.alive || H.phase !== 'setting') return;
+    const sp = getP(H.setter), pk = pickBuiltin();
+    emit({ k: 'sys', m: `⏰ ${sp ? sp.name : 'Oyuncu'} süreyi doldurdu, rastgele bir kelime seçildi.` });
+    applyWord(pk.w, pk.c);
+  }, SET_MS + 150);
+}
+function applyWord(w, hint) {
+  clearTimeout(H.tt);
+  H.word = trUp(w); H.cat = ''; H.src = 'duel';
+  H.meaning = hint; H.meaningFull = hint;
+  H.phase = 'playing'; H.turn = H.guesser; H.turnEnds = 0;
+  const sp = getP(H.setter), gp = H.guesser ? getP(H.guesser) : null;
+  emit({ k: 'sys', m: `✍️ ${sp ? sp.name : '?'} kelimeyi seçti, ${gp ? gp.name + ' tahmin ediyor' : 'herkes tahmin edebilir'}!` });
+  if (H.setter !== 'host') toOne(H.setter, { t: 'secret', r: H.round, w: H.word });   // kelimeyi sadece seçen görür
+  pushState();
+}
+function setWord(pid, w, hint) {
+  if (!H || H.phase !== 'setting' || H.set.mode !== 'duel' || pid !== H.setter) return;
+  w = trUp(String(w || '').replace(/\s+/g, ''));
+  if (w.length < 3 || w.length > 16 || [...w].some(c => !ALPHABET.includes(c))) return;
+  hint = String(hint || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  applyWord(w, hint);
+}
 function allGuessed() { return [...H.word].every(c => H.guessed.includes(c)); }
 function finishRound(res) {
   clearTimeout(H.tt); H.turnEnds = 0;
   H.phase = 'roundEnd'; H.res = res;
   if (res.won) emit({ k: 'good', m: `🎉 ${res.byName} kelimeyi buldu: ${H.word}`, fx: 'win' });
   else emit({ k: 'bad', m: `💀 Adam asıldı! Kelime: ${H.word}`, fx: 'lose' });
+  if (H.set.mode === 'duel') {
+    // kelimeyi seçene puan: tahmin edenlerin yaptığı her yanlış için 5, adam asılırsa +25
+    const sp = getP(H.setter), pts = (H.wrong.length + H.strikes) * 5 + (res.won ? 0 : 25);
+    if (sp && pts) { sp.score += pts; emit({ k: 'sys', m: `✍️ ${sp.name} kelimeyi seçtiği için +${pts} puan`, id: sp.id, pts }); }
+  }
   H.nt = setTimeout(afterRound, END_WAIT);
 }
 function afterRound() {
   if (!H || !H.alive || H.phase !== 'roundEnd') return;
   clearTimeout(H.nt);
-  if (H.round >= H.set.rounds) {
+  if (H.round >= H.total) {
     H.phase = 'gameEnd'; H.res = null;
     emit({ fx: 'end' });
     pushState();
@@ -964,7 +1021,10 @@ function backToLobby() {
   H.phase = 'lobby'; H.round = 0; H.word = ''; H.res = null;
   pushState();
 }
-function turnOk(pid) { return H.set.mode !== 'turn' || H.turn === pid; }
+function turnOk(pid) {
+  if (H.set.mode === 'duel' && H.set.guess === 'all') return pid !== H.setter;   // seçen dışında herkes
+  return H.set.mode === 'free' || H.turn === pid;
+}
 
 function guessLetter(pid, l) {
   if (H.phase !== 'playing' || !ALPHABET.includes(l)) return;
@@ -1013,6 +1073,14 @@ function onLeave(pid) {
   else p.on = false;
   emit({ k: 'sys', m: `${p.name} ayrıldı.`, fx: 'leave' });
   if (H.phase === 'playing' && H.set.mode === 'turn' && H.turn === pid) advanceTurn();
+  if (H.set.mode === 'duel' && (H.phase === 'setting' || H.phase === 'playing')) {
+    const othersLeft = H.players.some(x => x.on && x.id !== H.setter);
+    if ((H.phase === 'setting' && pid === H.setter) || (H.guesser && pid === H.guesser) || !othersLeft) {
+      emit({ k: 'sys', m: 'Tur iptal edildi, sıradakine geçiliyor.' });
+      skipRound();
+      return;
+    }
+  }
   pushState();
 }
 function kick(pid) { toOne(pid, { t: 'kicked' }); onLeave(pid); }
@@ -1032,6 +1100,7 @@ function hostMsg(m) {
   } else if (!getP(id)) return;
   else if (m.t === 'guess') guessLetter(id, String(m.l || ''));
   else if (m.t === 'word') guessWord(id, m.w);
+  else if (m.t === 'setword') setWord(id, m.w, m.h);
   else if (m.t === 'leave') onLeave(id);
 }
 
@@ -1135,6 +1204,7 @@ function onClientMsg(m) {
       }, 3000);
       break;
     case 'ping': break;
+    case 'secret': mySecret = String(m.w || ''); secretRound = m.r; if (S) render(); break;
     case 'deny': gone = true; goMenu(String(m.why || 'Katılamadın.')); break;
     case 'state':
       if (!joined) break;
@@ -1170,6 +1240,7 @@ function render() {
   if (!S) return;
   const want = S.phase === 'lobby' ? 'scr-lobby' : S.phase === 'gameEnd' ? 'scr-end' : 'scr-game';
   showScreen(want);
+  if (S.phase === 'lobby') { shownEnd = 0; shownSet = 0; }
   if (S.phase === 'lobby') renderLobby();
   else if (S.phase === 'gameEnd') renderEnd();
   else renderGame();
@@ -1179,6 +1250,8 @@ function render() {
     else { const el = $('endMeaning'); if (el) el.textContent = S.hint ? '💡 ' + S.hint : ''; }
   } else closeModal('end');
   if (S.phase !== 'playing') closeModal('wg');
+  if (S.phase !== 'setting') closeModal('setw');
+  else if (S.setterId === me.id && shownSet !== S.round) { shownSet = S.round; showSetModal(); }
 }
 
 /* ----- Lobi ----- */
@@ -1193,11 +1266,15 @@ function renderLobby() {
       ${p.id === me.id ? '<span class="tag you">sen</span>' : ''}
       ${isHost && p.id !== 'host' ? `<button class="kick" data-kick="${esc(p.id)}" title="Çıkar">✕</button>` : ''}
     </li>`).join('');
+  const duel = S.set.mode === 'duel';
+  const modeWhy = duel ? 'Sırayla biri kelime yazar, tahmin edenler süresiz uğraşır. Herkes bir kez kelime seçer (en az 2 kişi).'
+    : S.set.mode === 'turn' ? 'Sırayla, 25 sn süre' : 'Herkes aynı anda tahmin eder';
   const rows = [
-    ['rounds', 'Tur sayısı', '', [[3, '3'], [5, '5'], [8, '8']]],
-    ['lives', 'Can (yanlış hakkı)', 'Takım olarak', [[6, '6'], [8, '8'], [10, '10']]],
-    ['mode', 'Oyun şekli', S.set.mode === 'turn' ? 'Sırayla, 25 sn süre' : 'Herkes aynı anda tahmin eder', [['free', '⚡ Serbest'], ['turn', '🔄 Sıralı']]],
-    ['source', 'Kelimeler', S.set.source === 'tdk' ? "TDK sözlüğünden rastgele (zor!)" : 'Seçme kelimeler + TDK ipucu', [['list', '📖 Hazır'], ['tdk', '🇹🇷 TDK']]]
+    ...(duel ? [] : [['rounds', 'Tur sayısı', '', [[3, '3'], [5, '5'], [8, '8']]]]),
+    ['lives', 'Can (yanlış hakkı)', duel ? 'Tahmin edenler için' : 'Takım olarak', [[6, '6'], [8, '8'], [10, '10']]],
+    ['mode', 'Oyun şekli', modeWhy, [['free', '⚡ Serbest'], ['turn', '🔄 Sıralı'], ['duel', '✍️ Kelime Seç']]],
+    ...(duel ? [['guess', 'Kim tahmin eder?', S.set.guess === 'all' ? 'Kelimeyi seçen dışında herkes (can ortak)' : 'Sadece sıradaki oyuncu, diğerleri izler', [['next', '👤 Sıradaki'], ['all', '👥 Herkes']]]]
+             : [['source', 'Kelimeler', S.set.source === 'tdk' ? "TDK sözlüğünden rastgele (zor!)" : 'Seçme kelimeler + TDK ipucu', [['list', '📖 Hazır'], ['tdk', '🇹🇷 TDK']]]])
   ];
   $('settings').classList.toggle('locked', !isHost);
   $('settings').innerHTML = rows.map(([k, label, why, opts]) => `
@@ -1225,11 +1302,12 @@ function wrongStages(w, n) {
 function renderGame() {
   const playing = S.phase === 'playing';
   const myTurn = S.turnId === me.id;
-  $('gRound').textContent = `Tur ${S.round}/${S.set.rounds}`;
+  const setterP = S.players.find(p => p.id === S.setterId), guesserP = S.players.find(p => p.id === S.guesserId);
+  $('gRound').textContent = `Tur ${S.round}/${S.total || S.set.rounds}`;
   const src = S.src || S.set.source;
   $('gChips').innerHTML =
-    `<span class="chip">${S.set.mode === 'turn' ? '🔄 Sıralı' : '⚡ Serbest'}</span>` +
-    `<span class="chip">${src === 'tdk' ? '🇹🇷 TDK sözlüğü' : '📖 Hazır kelime'}</span>` +
+    `<span class="chip">${S.set.mode === 'turn' ? '🔄 Sıralı' : S.set.mode === 'duel' ? '✍️ Kelime Seç' : '⚡ Serbest'}</span>` +
+    `<span class="chip">${S.set.mode === 'duel' ? '✍️ Oyuncu kelimesi' : src === 'tdk' ? '🇹🇷 TDK sözlüğü' : '📖 Hazır kelime'}</span>` +
     `<span class="chip">👥 ${S.players.filter(p => p.on).length}</span>`;
   let hearts = '';
   for (let i = 0; i < S.set.lives; i++) hearts += `<span class="${i < S.set.lives - S.wrongN ? '' : 'gone'}">❤️</span>`;
@@ -1252,6 +1330,7 @@ function renderGame() {
   const same = S.round === prevRound && prevMask.length === S.mask.length;
   const wordEl = $('word');
   if (S.phase === 'picking') wordEl.innerHTML = '<span class="hint">Kelime seçiliyor…</span>';
+  else if (S.phase === 'setting') wordEl.innerHTML = `<span class="hint">✍️ ${esc(setterP ? setterP.name : 'Bir oyuncu')} bir kelime seçiyor…</span>`;
   else {
     wordEl.innerHTML = S.mask.map((c, i) => {
       if (c) return `<span class="slot filled" ${same && prevMask[i] ? 'style="animation:none"' : ''}>${esc(c)}</span>`;
@@ -1263,16 +1342,30 @@ function renderGame() {
 
   // ipucu
   let h = '';
-  if (S.phase !== 'picking') {
+  if (S.phase !== 'picking' && S.phase !== 'setting') {
     h = (S.cat ? `Kategori: <b>${esc(S.cat)}</b> · ` : '') + `<b>${S.len}</b> harf`;
-    if (S.hint) h += `<br>💡 <b>TDK:</b> ${esc(S.hint)}`;
+    if (S.hint) h += `<br>💡 <b>${S.hintSrc === 'setter' ? 'İpucu' : 'TDK'}:</b> ${esc(S.hint)}`;
     else if (S.hasHint) h += `<br>💡 TDK ipucu ${Math.max(1, S.hintAt - S.wrongN)} yanlıştan sonra açılır`;
+  }
+  // kelimeyi seçen oyuncu kendi kelimesini görür
+  if (S.set.mode === 'duel' && S.phase === 'playing' && S.setterId === me.id) {
+    const secret = isHost ? (H && H.word) : (secretRound === S.round ? mySecret : '');
+    if (secret) h += `<br><span class="secret">🤫 Senin kelimen: ${esc(secret)}</span>`;
   }
   $('hint').innerHTML = h;
 
   // sıra bilgisi
   const tb = $('turnBanner');
-  if (playing && S.set.mode === 'turn') {
+  if (S.set.mode === 'duel' && (playing || S.phase === 'setting')) {
+    const all = S.set.guess === 'all';
+    const mineSet = S.phase === 'setting' && S.setterId === me.id;
+    const iGuess = playing && (all ? S.setterId !== me.id : S.guesserId === me.id);
+    if (S.phase === 'setting') tb.textContent = mineSet ? '✍️ Sıra sende: kelimeni yaz!' : `✍️ ${setterP ? setterP.name : '…'} kelime seçiyor`;
+    else if (iGuess) tb.textContent = all ? '🎯 Herkes tahmin edebilir, süre yok!' : '🎯 Tahmin sende, süre yok!';
+    else if (S.setterId === me.id) tb.textContent = all ? '🤫 Herkes senin kelimeni tahmin ediyor' : `🤫 ${guesserP ? guesserP.name : '…'} senin kelimeni tahmin ediyor`;
+    else tb.textContent = `👀 ${guesserP ? guesserP.name : '…'} tahmin ediyor`;
+    tb.classList.toggle('mine', mineSet || iGuess);
+  } else if (playing && S.set.mode === 'turn') {
     const tp = S.players.find(p => p.id === S.turnId);
     tb.textContent = myTurn ? '🎯 Sıra sende!' : `Sıra: ${tp ? tp.name : '…'}`;
     tb.classList.toggle('mine', myTurn);
@@ -1282,7 +1375,7 @@ function renderGame() {
   lastTurn = S.turnId;
 
   // klavye
-  const canPlay = playing && (S.set.mode !== 'turn' || myTurn);
+  const canPlay = playing && (S.set.mode === 'free' || (S.set.mode === 'duel' && S.set.guess === 'all' ? S.setterId !== me.id : myTurn));
   kbEl.querySelectorAll('.key').forEach(b => {
     const l = b.dataset.l, isRight = S.mask.includes(l), isWrong = S.wrong.includes(l);
     b.classList.toggle('correct', isRight);
@@ -1309,15 +1402,46 @@ function renderLog() {
 }
 function showEndModal() {
   const won = S.res && S.res.won;
-  const last = S.round >= S.set.rounds;
+  const last = S.round >= (S.total || S.set.rounds);
+  const sp = S.set.mode === 'duel' ? S.players.find(p => p.id === S.setterId) : null;
   showModal(`
     <h3>${won ? '🎉 Kelime bulundu!' : '💀 Adam asıldı…'}</h3>
     <p>${won ? esc(S.res.byName) + ' kelimeyi tamamladı.' : 'Canlar tükendi. Kelime:'}</p>
     <div class="big-word">${esc(S.word)}</div>
+    ${sp ? `<p class="tiny">✍️ Kelimeyi seçen: <b>${esc(sp.name)}</b></p>` : ''}
     <p class="tiny" id="endMeaning">${S.hint ? '💡 ' + esc(S.hint) : ''}</p>
     <p class="tiny">${last ? 'Final sonuçları birazdan…' : 'Sonraki tur birazdan başlıyor…'}</p>
     ${isHost ? '<div class="row"><button class="btn" id="skipBtn">Devam ▶</button></div>' : ''}`, 'end');
   const sk = $('skipBtn'); if (sk) sk.onclick = () => afterRound();
+}
+
+function showSetModal() {
+  const g = S.players.find(p => p.id === S.guesserId);
+  showModal(`<h3>✍️ Kelimeni seç!</h3>
+    <p class="tiny"><b>${g ? esc(g.name) : 'Diğer herkes'}</b> bu kelimeyi süresiz tahmin etmeye çalışacak. Sadece harf kullan (3–16 harf).</p>
+    <input id="swInput" type="text" maxlength="16" autocomplete="off" spellcheck="false" placeholder="örn. mandalina" style="text-align:center;text-transform:uppercase;margin-top:.6rem">
+    <input id="swHint" type="text" maxlength="60" autocomplete="off" placeholder="İpucu (isteğe bağlı)" style="text-align:center;margin-top:.5rem;font-size:1rem">
+    <p id="swErr" class="tiny" style="color:#9b2b1f;min-height:1.3em"></p>
+    <p class="tiny">⏳ Kalan süre: <b id="setLeft">90</b> sn (dolarsa rastgele kelime seçilir)</p>
+    <div class="row"><button class="btn ghost" id="swRnd" type="button">🎲 Rastgele</button><button class="btn alt" id="swOk" type="button">Gönder</button></div>`, 'setw');
+  const inp = $('swInput'), hint = $('swHint'), err = $('swErr');
+  inp.focus();
+  $('swRnd').onclick = () => { const x = BUILTIN[rnd(BUILTIN.length)]; inp.value = trUp(x.w); hint.value = x.c; err.textContent = ''; };
+  const go = () => {
+    const w = trUp(inp.value.replace(/\s+/g, ''));
+    if (w.length < 3 || w.length > 16) { err.textContent = 'Kelime 3 ile 16 harf arasında olmalı.'; return; }
+    if ([...w].some(c => !ALPHABET.includes(c))) { err.textContent = 'Sadece Türkçe harfler kullan (rakam, boşluk, işaret olmaz).'; return; }
+    $('swOk').disabled = true; $('swRnd').disabled = true; $('swOk').textContent = 'Gönderildi ✓';
+    const hv = hint.value;
+    if (isHost) { setWord('host', w, hv); return; }
+    const sendIt = () => pubMsg(upT, { f: myId, t: 'setword', w, h: hv });
+    sendIt();
+    let n = 0;
+    const iv = setInterval(() => { if (!S || S.phase !== 'setting' || ++n > 3) { clearInterval(iv); return; } sendIt(); }, 2500);
+  };
+  $('swOk').onclick = go;
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+  hint.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
 }
 
 /* ----- Sonuç ----- */
@@ -1341,7 +1465,9 @@ function renderEnd() {
 /* ---------------- Süre çubuğu ---------------- */
 setInterval(() => {
   const wrap = $('turnBarWrap');
-  if (!S || S.phase !== 'playing' || S.set.mode !== 'turn' || !S.turnEnds) { wrap.classList.add('hidden'); return; }
+  const sl = $('setLeft');
+  if (sl && S && S.phase === 'setting') sl.textContent = Math.max(0, Math.ceil((S.turnEnds - (Date.now() + off)) / 1000));
+  if (!S || !S.turnEnds || !((S.phase === 'playing' && S.set.mode === 'turn') || S.phase === 'setting')) { wrap.classList.add('hidden'); return; }
   const left = S.turnEnds - (Date.now() + off);
   const frac = clamp(left / S.turnMs, 0, 1);
   wrap.classList.remove('hidden');
